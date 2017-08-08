@@ -116,11 +116,14 @@ class AmclNode
 {
 public:
   AmclNode();
+  AmclNode(int index);
   ~AmclNode();
 
   /**
      * @brief Uses TF and LaserScan messages from bag file to drive AMCL instead
      */
+  int index_;
+
   void runFromBag(const std::string &in_bag_fn);
   void setResetParam(double param);
   double getWSum();
@@ -289,53 +292,54 @@ std::vector<std::pair<int, int>> AmclNode::free_space_indices;
 
 #define USAGE "USAGE: amcl"
 
-boost::shared_ptr<AmclNode> amcl_node_ptr;
+// boost::shared_ptr<AmclNode> amcl_node_ptr;
+// boost::shared_ptr<AmclNode> amcl_node_ptr2;
 
 void sigintHandler(int sig)
 {
   // Save latest pose as we're shutting down.
-  amcl_node_ptr->savePoseToServer();
+  // amcl_node_ptr->savePoseToServer();
   ros::shutdown();
 }
 
-void optimiseParamFromBag(const std::string & in_bag_fn)
-{
-  time_t t = time(NULL);
-  std::ofstream ofs;
-  std::string fname;
-  fname = "optimise_log_" + std::to_string(t) + ".dat";
-  ofs.open(fname);
-  if(!ofs){
-    ROS_ERROR("Optimise log can't create");
-    ros::shutdown();
-  }
-  double param;
-  double w_sum;
-  double init_param = 0.0;
-  double param_interval = 0.1;
-  double param_magnification = 100;
-  bool is_param_incremental = true;
-  double finish_param = 10.0;
-  param = init_param;
-  while(ros::ok() && param <= finish_param)
-  {
-    amcl_node_ptr->setResetParam(param);
-    amcl_node_ptr->requestMap();
-    amcl_node_ptr->runFromBag(in_bag_fn);
-    w_sum = amcl_node_ptr->getWSum();
-    std::cout << "test" << param << " " << w_sum << std::endl;
-    ofs << param << " " << w_sum << std::endl;
-    if(is_param_incremental){
-      param += param_interval;
-    }
-    else{
-      param *= param_magnification;
-    }
-    amcl_node_ptr.reset(new AmclNode());
-  }
-  ofs.close();
-  ros::shutdown();
-}
+// void optimiseParamFromBag(const std::string & in_bag_fn)
+// {
+//   time_t t = time(NULL);
+//   std::ofstream ofs;
+//   std::string fname;
+//   fname = "optimise_log_" + std::to_string(t) + ".dat";
+//   ofs.open(fname);
+//   if(!ofs){
+//     ROS_ERROR("Optimise log can't create");
+//     ros::shutdown();
+//   }
+//   double param;
+//   double w_sum;
+//   double init_param = 0.0;
+//   double param_interval = 0.1;
+//   double param_magnification = 100;
+//   bool is_param_incremental = true;
+//   double finish_param = 10.0;
+//   param = init_param;
+//   while(ros::ok() && param <= finish_param)
+//   {
+//     amcl_node_ptr->setResetParam(param);
+//     // amcl_node_ptr->requestMap();
+//     amcl_node_ptr->runFromBag(in_bag_fn);
+//     w_sum = amcl_node_ptr->getWSum();
+//     std::cout << "test" << param << " " << w_sum << std::endl;
+//     ofs << param << " " << w_sum << std::endl;
+//     if(is_param_incremental){
+//       param += param_interval;
+//     }
+//     else{
+//       param *= param_magnification;
+//     }
+//     amcl_node_ptr.reset(new AmclNode());
+//   }
+//   ofs.close();
+//   ros::shutdown();
+// }
 
 int main(int argc, char **argv)
 {
@@ -346,23 +350,37 @@ int main(int argc, char **argv)
   signal(SIGINT, sigintHandler);
 
   // Make our node available to sigintHandler
-  amcl_node_ptr.reset(new AmclNode());
+  // amcl_node_ptr.reset(new AmclNode());
+  // amcl_node_ptr2.reset(new AmclNode(1));
+
+  std::vector<boost::shared_ptr<AmclNode>> amcl_ptr_vector;
+
+  for(int i=0; i<10; i++){
+    boost::shared_ptr<AmclNode> amcl_node_ptr(new AmclNode(i));
+    amcl_ptr_vector.push_back(amcl_node_ptr);
+  }
 
   if (argc == 1)
   {
     // run using ROS input
     ros::spin();
   }
-  else if ((argc == 3) && (std::string(argv[1]) == "--run-from-bag"))
-  {
-    amcl_node_ptr->runFromBag(argv[2]);
-  }
-  else if ((argc == 3) && (std::string(argv[1]) == "--param-optimise-from-bag"))
-  {
-    optimiseParamFromBag(argv[2]);
-  }
+  // else if ((argc == 3) && (std::string(argv[1]) == "--run-from-bag"))
+  // {
+  //   amcl_node_ptr->runFromBag(argv[2]);
+  // }
+  // else if ((argc == 3) && (std::string(argv[1]) == "--param-optimise-from-bag"))
+  // {
+  //   optimiseParamFromBag(argv[2]);
+  // }
   // Without this, our boost locks are not shut down nicely
-  amcl_node_ptr.reset();
+  // amcl_node_ptr.reset();
+  std::vector<boost::shared_ptr<AmclNode>>::iterator i = amcl_ptr_vector.begin();
+  std::vector<boost::shared_ptr<AmclNode>>::iterator iend = amcl_ptr_vector.end();
+  while(i != iend){
+    i->reset(new AmclNode());
+    ++i;
+  }
 
   // To quote Morgan, Hooray!
   return (0);
@@ -483,6 +501,163 @@ AmclNode::AmclNode() : sent_first_transform_(false),
 
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
+  reset_notify_pub_ = nh_.advertise<std_msgs::Bool>("reset_notify", 2, true);
+  w_sum_pub_ = nh_.advertise<std_msgs::Float64>("w_sum", 10, true);
+  global_loc_srv_ = nh_.advertiseService("global_localization",
+                                         &AmclNode::globalLocalizationCallback,
+                                         this);
+  nomotion_update_srv_ = nh_.advertiseService("request_nomotion_update", &AmclNode::nomotionUpdateCallback, this);
+  set_map_srv_ = nh_.advertiseService("set_map", &AmclNode::setMapCallback, this);
+  set_reset_flag_srv_ = nh_.advertiseService("set_reset_flag", &AmclNode::setResetFlagCallback, this);
+
+  laser_scan_sub_ = new message_filters::Subscriber<sensor_msgs::LaserScan>(nh_, scan_topic_, 100);
+  laser_scan_filter_ =
+      new tf::MessageFilter<sensor_msgs::LaserScan>(*laser_scan_sub_,
+                                                    *tf_,
+                                                    odom_frame_id_,
+                                                    100);
+  laser_scan_filter_->registerCallback(boost::bind(&AmclNode::laserReceived,
+                                                   this, _1));
+  initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
+
+  if (use_map_topic_)
+  {
+    map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
+    ROS_INFO("Subscribed to map topic.");
+  }
+  else
+  {
+    requestMap();
+  }
+  m_force_update = false;
+
+  dsrv_ = new dynamic_reconfigure::Server<amcl::AMCLConfig>(ros::NodeHandle("~"));
+  dynamic_reconfigure::Server<amcl::AMCLConfig>::CallbackType cb = boost::bind(&AmclNode::reconfigureCB, this, _1, _2);
+  dsrv_->setCallback(cb);
+
+  // 15s timer to warn on lack of receipt of laser scans, #5209
+  laser_check_interval_ = ros::Duration(15.0);
+  check_laser_timer_ = nh_.createTimer(laser_check_interval_,
+                                       boost::bind(&AmclNode::checkLaserReceived, this, _1));
+}
+
+AmclNode::AmclNode(int index) : sent_first_transform_(false),
+                       latest_tf_valid_(false),
+                       map_(NULL),
+                       pf_(NULL),
+                       resample_count_(0),
+                       odom_(NULL),
+                       laser_(NULL),
+                       private_nh_("amcl"+std::to_string(index)),
+                       initial_pose_hyp_(NULL),
+                       first_map_received_(false),
+                       first_reconfigure_call_(true),
+                       do_reset_(true),
+                       index_(index)
+{
+  boost::recursive_mutex::scoped_lock l(configuration_mutex_);
+
+  // Grab params off the param server
+  private_nh_.param("use_map_topic", use_map_topic_, false);
+  private_nh_.param("first_map_only", first_map_only_, false);
+
+  double tmp;
+  w_sum_sum_ = 0;
+  private_nh_.param("gui_publish_rate", tmp, -1.0);
+  gui_publish_period = ros::Duration(1.0 / tmp);
+  private_nh_.param("save_pose_rate", tmp, 0.5);
+  save_pose_period = ros::Duration(1.0 / tmp);
+
+  private_nh_.param("laser_min_range", laser_min_range_, -1.0);
+  private_nh_.param("laser_max_range", laser_max_range_, -1.0);
+  private_nh_.param("laser_max_beams", max_beams_, 30);
+  private_nh_.param("min_particles", min_particles_, 100);
+  private_nh_.param("max_particles", max_particles_, 5000);
+  private_nh_.param("kld_err", pf_err_, 0.01);
+  private_nh_.param("kld_z", pf_z_, 0.99);
+  private_nh_.param("odom_alpha1", alpha1_, 0.2);
+  private_nh_.param("odom_alpha2", alpha2_, 0.2);
+  private_nh_.param("odom_alpha3", alpha3_, 0.2);
+  private_nh_.param("odom_alpha4", alpha4_, 0.2);
+  private_nh_.param("odom_alpha5", alpha5_, 0.2);
+
+  private_nh_.param("do_beamskip", do_beamskip_, false);
+  private_nh_.param("beam_skip_distance", beam_skip_distance_, 0.5);
+  private_nh_.param("beam_skip_threshold", beam_skip_threshold_, 0.3);
+  private_nh_.param("beam_skip_error_threshold_", beam_skip_error_threshold_, 0.9);
+
+  private_nh_.param("laser_z_hit", z_hit_, 0.95);
+  private_nh_.param("laser_z_short", z_short_, 0.1);
+  private_nh_.param("laser_z_max", z_max_, 0.05);
+  private_nh_.param("laser_z_rand", z_rand_, 0.05);
+  private_nh_.param("laser_sigma_hit", sigma_hit_, 0.2);
+  private_nh_.param("laser_lambda_short", lambda_short_, 0.1);
+  private_nh_.param("laser_likelihood_max_dist", laser_likelihood_max_dist_, 2.0);
+  std::string tmp_model_type;
+  private_nh_.param("laser_model_type", tmp_model_type, std::string("likelihood_field"));
+  if (tmp_model_type == "beam")
+    laser_model_type_ = LASER_MODEL_BEAM;
+  else if (tmp_model_type == "likelihood_field")
+    laser_model_type_ = LASER_MODEL_LIKELIHOOD_FIELD;
+  else if (tmp_model_type == "likelihood_field_prob")
+  {
+    laser_model_type_ = LASER_MODEL_LIKELIHOOD_FIELD_PROB;
+  }
+  else
+  {
+    ROS_WARN("Unknown laser model type \"%s\"; defaulting to likelihood_field model",
+             tmp_model_type.c_str());
+    laser_model_type_ = LASER_MODEL_LIKELIHOOD_FIELD;
+  }
+
+  private_nh_.param("odom_model_type", tmp_model_type, std::string("diff"));
+  if (tmp_model_type == "diff")
+    odom_model_type_ = ODOM_MODEL_DIFF;
+  else if (tmp_model_type == "omni")
+    odom_model_type_ = ODOM_MODEL_OMNI;
+  else if (tmp_model_type == "diff-corrected")
+    odom_model_type_ = ODOM_MODEL_DIFF_CORRECTED;
+  else if (tmp_model_type == "omni-corrected")
+    odom_model_type_ = ODOM_MODEL_OMNI_CORRECTED;
+  else
+  {
+    ROS_WARN("Unknown odom model type \"%s\"; defaulting to diff model",
+             tmp_model_type.c_str());
+    odom_model_type_ = ODOM_MODEL_DIFF;
+  }
+
+  private_nh_.param("update_min_d", d_thresh_, 0.2);
+  private_nh_.param("update_min_a", a_thresh_, M_PI / 6.0);
+  private_nh_.param("odom_frame_id", odom_frame_id_, std::string("odom"));
+  private_nh_.param("base_frame_id", base_frame_id_, std::string("base_link"));
+  private_nh_.param("global_frame_id", global_frame_id_, std::string("map"));
+  private_nh_.param("resample_interval", resample_interval_, 2);
+  double tmp_tol;
+  private_nh_.param("transform_tolerance", tmp_tol, 0.1);
+  private_nh_.param("recovery_alpha_slow", alpha_slow_, 0.001);
+  private_nh_.param("recovery_alpha_fast", alpha_fast_, 0.1);
+  private_nh_.param("reset_th_alpha", alpha_, 0.001);
+  private_nh_.param("reset_th_cov", reset_th_cov_, 0.0000001);
+  private_nh_.param("do_expansion_resettings", do_reset_, do_reset_);
+  private_nh_.param("tf_broadcast", tf_broadcast_, true);
+
+  transform_tolerance_.fromSec(tmp_tol);
+
+  {
+    double bag_scan_period;
+    private_nh_.param("bag_scan_period", bag_scan_period, -1.0);
+    bag_scan_period_.fromSec(bag_scan_period);
+  }
+
+  updatePoseFromServer();
+
+  cloud_pub_interval.fromSec(1.0);
+  tfb_ = new tf::TransformBroadcaster();
+  tf_ = new TransformListenerWrapper();
+
+  std::cout << index_ << std::endl;
+  pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
+  particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud"+std::to_string(index_), 2, true);
   reset_notify_pub_ = nh_.advertise<std_msgs::Bool>("reset_notify", 2, true);
   w_sum_pub_ = nh_.advertise<std_msgs::Float64>("w_sum", 10, true);
   global_loc_srv_ = nh_.advertiseService("global_localization",
@@ -678,7 +853,7 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
 
 void AmclNode::setResetParam(double param)
 {
-  alpha_ = param;
+  pf_->alpha = param;
 }
 
 double AmclNode::getWSum()
