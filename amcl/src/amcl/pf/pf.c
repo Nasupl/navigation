@@ -495,26 +495,33 @@ void pf_update_resample(pf_t *pf)
 {
   int i;
   double total;
+  //double *randlist;
   pf_sample_set_t *set_a, *set_b;
   pf_sample_t *sample_a, *sample_b;
+  //pf_pdf_discrete_t *pdf;
 
-  //double r,c,U;
-  //int m;
-  //double count_inv;
-  double* c;
-
-  double w_diff;
+  double r, c, U;
+  int m;
+  double count_inv;
 
   set_a = pf->sets + pf->current_set;
   set_b = pf->sets + (pf->current_set + 1) % 2;
 
-  // Build up cumulative probability table for resampling.
-  // TODO: Replace this with a more efficient procedure
-  // (e.g., http://www.network-theory.co.uk/docs/gslref/GeneralDiscreteDistributions.html)
-  c = (double*)malloc(sizeof(double)*(set_a->sample_count+1));
-  c[0] = 0.0;
-  for(i=0;i<set_a->sample_count;i++)
-    c[i+1] = c[i]+set_a->samples[i].weight;
+  // Create the discrete distribution to sample from
+  /*
+  total = 0;
+  randlist = calloc(set_a->sample_count, sizeof(double));
+  for (i = 0; i < set_a->sample_count; i++)
+  {
+    total += set_a->samples[i].weight;
+    randlist[i] = set_a->samples[i].weight;
+  }
+  */
+
+  //printf("resample total %f\n", total);
+
+  // Initialize the random number generator
+  //pdf = pf_pdf_discrete_alloc(set_a->sample_count, randlist);
 
   // Create the kd tree for adaptive sampling
   pf_kdtree_clear(set_b->kdtree);
@@ -523,87 +530,66 @@ void pf_update_resample(pf_t *pf)
   total = 0;
   set_b->sample_count = 0;
 
-  w_diff = 1.0 - pf->w_fast / pf->w_slow;
-  if(w_diff < 0.0)
-    w_diff = 0.0;
-  //printf("w_diff: %9.6f\n", w_diff);
-
-  // Can't (easily) combine low-variance sampler with KLD adaptive
-  // sampling, so we'll take the more traditional route.
-  /*
   // Low-variance resampler, taken from Probabilistic Robotics, p110
-  count_inv = 1.0/set_a->sample_count;
+  count_inv = 1.0 / set_a->sample_count;
   r = drand48() * count_inv;
   c = set_a->samples[0].weight;
   i = 0;
   m = 0;
-  */
-  while(set_b->sample_count < pf->max_samples)
+  while (set_b->sample_count < pf->max_samples)
   {
-    sample_b = set_b->samples + set_b->sample_count++;
-
-    if(drand48() < w_diff)
-      sample_b->pose = (pf->random_pose_fn)(pf->random_pose_data);
-    else
+    U = r + m * count_inv;
+    while (U > c)
     {
-      // Can't (easily) combine low-variance sampler with KLD adaptive
-      // sampling, so we'll take the more traditional route.
-      /*
-      // Low-variance resampler, taken from Probabilistic Robotics, p110
-      U = r + m * count_inv;
-      while(U>c)
+      i++;
+      // Handle wrap-around by resetting counters and picking a new random
+      // number
+      if (i >= set_a->sample_count)
       {
-        i++;
-        // Handle wrap-around by resetting counters and picking a new random
-        // number
-        if(i >= set_a->sample_count)
-        {
-          r = drand48() * count_inv;
-          c = set_a->samples[0].weight;
-          i = 0;
-          m = 0;
-          U = r + m * count_inv;
-          continue;
-        }
-        c += set_a->samples[i].weight;
+        r = drand48() * count_inv;
+        c = set_a->samples[0].weight;
+        i = 0;
+        m = 0;
+        U = r + m * count_inv;
+        continue;
       }
-      m++;
-      */
-
-      // Naive discrete event sampler
-      double r;
-      r = drand48();
-      for(i=0;i<set_a->sample_count;i++)
-      {
-        if((c[i] <= r) && (r < c[i+1]))
-          break;
-      }
-      assert(i<set_a->sample_count);
-
-      sample_a = set_a->samples + i;
-
-      assert(sample_a->weight > 0);
-
-      // Add sample to list
-      sample_b->pose = sample_a->pose;
+      c += set_a->samples[i].weight;
     }
 
+    //i = pf_pdf_discrete_sample(pdf);
+
+    sample_a = set_a->samples + i;
+
+    //printf("%d %f\n", i, sample_a->weight);
+    assert(sample_a->weight > 0);
+
+    // Add sample to list
+    sample_b = set_b->samples + set_b->sample_count++;
+    sample_b->pose = sample_a->pose;
     sample_b->weight = 1.0;
     total += sample_b->weight;
 
     // Add sample to histogram
     pf_kdtree_insert(set_b->kdtree, sample_b->pose, sample_b->weight);
 
+    //fprintf(stderr, "resample %d %d %d\n", set_b->sample_count, set_b->kdtree->leaf_count,
+    //pf_resample_limit(pf, set_b->kdtree->leaf_count));
+
     // See if we have enough samples yet
     if (set_b->sample_count > pf_resample_limit(pf, set_b->kdtree->leaf_count))
       break;
+
+    m++;
   }
 
   // Reset averages, to avoid spiraling off into complete randomness.
-  if(w_diff > 0.0)
-    pf->w_slow = pf->w_fast = 0.0;
+  // if(w_diff > 0.0)
+  //   pf->w_slow = pf->w_fast = 0.0;
 
   //fprintf(stderr, "\n\n");
+
+  //pf_pdf_discrete_free(pdf);
+  //free(randlist);
 
   // Normalize weights
   for (i = 0; i < set_b->sample_count; i++)
@@ -618,12 +604,8 @@ void pf_update_resample(pf_t *pf)
   // Use the newly created sample set
   pf->current_set = (pf->current_set + 1) % 2;
 
-  pf_update_converged(pf);
-
-  free(c);
   return;
 }
-
 
 // Compute the required number of samples, given that there are k bins
 // with samples in them.  This is taken directly from Fox et al.
