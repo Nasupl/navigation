@@ -2,32 +2,36 @@
 
 <launch>
   <arg name="robot_name"    default="alpha"/>
+  <arg name="init_pos_file" default="$(find orne_navigation_executor)/initial_pose_cfg/initial_pose.yaml"/>
 
   <group ns="multi_mcl">
     <node pkg="amcl" type="amcl" name="amcl" output="screen">
       <rosparam file="$(find amcl)/param/localization_params.yaml" command="load"/>
       <rosparam file="$(find orne_navigation_executor)/param/localization_params_$(arg robot_name).yaml" command="load"/>
+      <rosparam file="$(arg init_pos_file)" command="load"/>
       <remap from="scan" to="/scan"/>
     </node>
-  </group> -->
-  <group ns="er_mcl">
+  </group>
+  <!-- <group ns="er_mcl">
     <node pkg="amcl" type="amcl" name="amcl" output="screen">
       <rosparam file="$(find amcl)/param/localization_params.yaml" command="load"/>
       <rosparam file="$(find orne_navigation_executor)/param/localization_params_$(arg robot_name).yaml" command="load"/>
+      <rosparam file="$(arg init_pos_file)" command="load"/>
       <param name="use_multi_mcl" type="bool" value="false"/>
       <param name="tf_broadcast" type="bool" value="false"/>
       <remap from="scan" to="/scan"/>
     </node>
   </group>
   <group ns="mcl">
-  <node pkg="amcl" type="amcl" name="amcl" output="screen">
-    <rosparam file="$(find amcl)/param/localization_params.yaml" command="load"/>
-    <rosparam file="$(find orne_navigation_executor)/param/localization_params_$(arg robot_name).yaml" command="load"/>
-    <param name="use_multi_mcl" type="bool" value="false"/>
-    <param name="reset_th_alpha" type="double" value="0.0"/>
-    <param name="do_expansion_resettings" type="bool" value="false"/>
-    <param name="tf_broadcast" type="bool" value="false"/>
-    <remap from="scan" to="/scan"/>
-  </node>
-</group>
+    <node pkg="amcl" type="amcl" name="amcl" output="screen">
+      <rosparam file="$(find amcl)/param/localization_params.yaml" command="load"/>
+      <rosparam file="$(find orne_navigation_executor)/param/localization_params_$(arg robot_name).yaml" command="load"/>
+      <rosparam file="$(arg init_pos_file)" command="load"/>
+      <param name="use_multi_mcl" type="bool" value="false"/>
+      <param name="reset_th_alpha" type="double" value="0.0"/>
+      <param name="do_expansion_resettings" type="bool" value="false"/>
+      <param name="tf_broadcast" type="bool" value="false"/>
+      <remap from="scan" to="/scan"/>
+    </node>
+  </group> -->
 </launch>

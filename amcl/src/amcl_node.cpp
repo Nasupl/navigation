@@ -1,4 +1,4 @@
-/*
+/* /*
  *  Copyright (c) 2008, Willow Garage, Inc.
  *  All rights reserved.
  *
@@ -92,6 +92,12 @@ typedef struct
   pf_matrix_t pf_pose_cov;
 
 } amcl_hyp_t;
+
+typedef struct
+{
+  double weight;
+  double alpha_th;
+} alpha_th_particle;
 
 static double
 normalize(double z)
@@ -219,11 +225,13 @@ private:
 
   std::mt19937 mt_;
   std::random_device rnd_;
-  std::uniform_real_distribution<double> rand_alpha_;
+
+  double alpha_tmp_;
+  bool alpha_tmp_init_;
 
   // Particle filter
-  std::vector<pf_t*> pf_vector_;
-  int pf_vector_size_;
+  std::vector<alpha_th_particle> alpha_th_vector_;
+  int alpha_th_vector_size_;
   pf_t *pf_;
   double pf_err_, pf_z_;
   bool pf_init_;
@@ -233,8 +241,6 @@ private:
   int resample_count_;
   double laser_min_range_;
   double laser_max_range_;
-
-  int pub_cnt_;
 
   //Nomotion update control
   bool m_force_update; // used to temporarily let amcl update samples even when no motion occurs...
@@ -263,16 +269,13 @@ private:
   ros::Publisher particlecloud_pub_;
   ros::Publisher reset_notify_pub_;
   ros::Publisher w_sum_pub_;
+  ros::Publisher w_sum_diff_pub_;
   ros::ServiceServer global_loc_srv_;
   ros::ServiceServer nomotion_update_srv_; //to let amcl update samples without requiring motion
   ros::ServiceServer set_map_srv_;
   ros::ServiceServer set_reset_flag_srv_;
   ros::Subscriber initial_pose_sub_old_;
   ros::Subscriber map_sub_;
-
-  std::vector<ros::Publisher> particlecloud_pub_vec_;
-  std::vector<ros::Publisher> reset_notify_pub_vec_;
-  std::vector<ros::Publisher> w_sum_pub_vec_;
 
   amcl_hyp_t *initial_pose_hyp_;
   bool first_map_received_;
@@ -402,7 +405,7 @@ AmclNode::AmclNode() : sent_first_transform_(false),
                        initial_pose_hyp_(NULL),
                        first_map_received_(false),
                        first_reconfigure_call_(true),
-                       pf_vector_size_(10),
+                       alpha_th_vector_size_(50),
                        do_reset_(true)
 {
   boost::recursive_mutex::scoped_lock l(configuration_mutex_);
@@ -413,8 +416,7 @@ AmclNode::AmclNode() : sent_first_transform_(false),
   private_nh_.param("use_multi_mcl", multi_mcl_, true);
 
   double tmp;
-  pub_cnt_ = 0;
-
+  
   w_sum_sum_ = 0;
   private_nh_.param("gui_publish_rate", tmp, -1.0);
   gui_publish_period = ros::Duration(1.0 / tmp);
@@ -497,7 +499,7 @@ AmclNode::AmclNode() : sent_first_transform_(false),
   transform_tolerance_.fromSec(tmp_tol);
 
   mt_.seed(rnd_());
-  rand_alpha_ = std::uniform_real_distribution<double> (0.0,10.0);
+  alpha_tmp_init_ = false;
 
   {
     double bag_scan_period;
@@ -515,12 +517,7 @@ AmclNode::AmclNode() : sent_first_transform_(false),
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
   reset_notify_pub_ = nh_.advertise<std_msgs::Bool>("reset_notify", 2, true);
   w_sum_pub_ = nh_.advertise<std_msgs::Float64>("w_sum", 10, true);
-
-  for(int i=0;i<pf_vector_size_;i++){
-    particlecloud_pub_vec_.push_back(nh_.advertise<geometry_msgs::PoseArray>("particlecloud"+std::to_string(i), 2, true));
-    reset_notify_pub_vec_.push_back(reset_notify_pub_ = nh_.advertise<std_msgs::Bool>("reset_notify"+std::to_string(i), 2, true));
-    w_sum_pub_vec_.push_back(nh_.advertise<std_msgs::Float64>("w_sum"+std::to_string(i), 10, true));
-  }
+  w_sum_diff_pub_ = nh_.advertise<std_msgs::Float64>("w_sum_diff", 10, true);
 
   global_loc_srv_ = nh_.advertiseService("global_localization",
                                          &AmclNode::globalLocalizationCallback,
@@ -643,22 +640,18 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
   beam_skip_threshold_ = config.beam_skip_threshold;
 
   alpha_ = config.reset_th_alpha;
-  pf_vector_.clear();
-  for(int i; i=0; i<pf_vector_size_){
-    pf_vector_.push_back(
-      pf_alloc(min_particles_, max_particles_,
-                 alpha_slow_, alpha_fast_,
-                 (int)do_reset_,
-                 rand_alpha_(mt_), reset_th_cov_,
-                 (pf_init_model_fn_t)AmclNode::uniformPoseGenerator,
-                 (void *)map_
-                )
-    );
-    pf_vector_[i]->pop_err = pf_err_;
-    pf_vector_[i]->pop_z = pf_z_;
+
+  std::normal_distribution<double> rand_alpha_(alpha_, 2.0);
+  
+  alpha_th_vector_.clear();
+  for(int i=0; i<alpha_th_vector_size_; i++){
+    alpha_th_particle th_particle;
+    th_particle.weight = 1.0 / alpha_th_vector_size_;
+    th_particle.alpha_th = rand_alpha_(mt_);
+    alpha_th_vector_.push_back(th_particle);
   }
-
-
+  
+  
   pf_ = pf_alloc(min_particles_, max_particles_,
                  alpha_slow_, alpha_fast_,
                  (int)do_reset_,
@@ -957,20 +950,14 @@ void AmclNode::handleMapMessage(const nav_msgs::OccupancyGrid &msg)
   // Create the particle filter
   if(do_reset_) ROS_INFO("Added expansion resettings!");
   /// ROS_INFO("do_reset: %d \n", (int)do_reset_);
-  pf_vector_.clear();
-  for(int i=0; i<pf_vector_size_; i++){
-    double alpha_ran = rand_alpha_(mt_);
-    pf_vector_.push_back(
-      pf_alloc(min_particles_, max_particles_,
-                 alpha_slow_, alpha_fast_,
-                 (int)do_reset_,
-                 alpha_ran, reset_th_cov_,
-                 (pf_init_model_fn_t)AmclNode::uniformPoseGenerator,
-                 (void *)map_
-                )
-    );
-    pf_vector_[i]->pop_err = pf_err_;
-    pf_vector_[i]->pop_z = pf_z_;
+  
+  std::normal_distribution<double> rand_alpha_(alpha_, 2.0);
+  alpha_th_vector_.clear();
+  for(int i=0; i<alpha_th_vector_size_; i++){
+    alpha_th_particle th_particle;
+    th_particle.weight = 1.0 / alpha_th_vector_size_;
+    th_particle.alpha_th = rand_alpha_(mt_);
+    alpha_th_vector_.push_back(th_particle);
   }
 
   pf_ = pf_alloc(min_particles_, max_particles_,
@@ -995,11 +982,7 @@ void AmclNode::handleMapMessage(const nav_msgs::OccupancyGrid &msg)
   pf_init(pf_, pf_init_pose_mean, pf_init_pose_cov);
   pf_init_ = false;
 
-  // std::vector<pf_t*>::iterator itr = pf_vector_.begin();
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-    pf_init(*itr, pf_init_pose_mean, pf_init_pose_cov);
-  }
-
+  
   // Instantiate the sensor objects
   // Odometry
   delete odom_;
@@ -1044,9 +1027,6 @@ void AmclNode::freeMapDependentMemory()
   }
   if (pf_ != NULL)
   {
-    for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-      pf_free(*itr);
-    }
     pf_free(pf_);
     pf_ = NULL;
   }
@@ -1170,11 +1150,6 @@ bool AmclNode::globalLocalizationCallback(std_srvs::Empty::Request &req,
   }
   boost::recursive_mutex::scoped_lock gl(configuration_mutex_);
   ROS_INFO("Initializing with uniform distribution");
-  auto itr = pf_vector_.begin();
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-    pf_init_model(*itr, (pf_init_model_fn_t)AmclNode::uniformPoseGenerator,
-                (void *)map_);
-  }
   pf_init_model(pf_, (pf_init_model_fn_t)AmclNode::uniformPoseGenerator,
                 (void *)map_);
   ROS_INFO("Global initialisation done!");
@@ -1206,57 +1181,54 @@ bool AmclNode::setResetFlagCallback(std_srvs::SetBool::Request &req,
   do_reset_ = req.data;
   // ROS_INFO("do_reset: %d \n", (int)do_reset_);
   res.message = (do_reset_) ? std::string("true") : std::string("false");
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-    pf_set_reset_flag(*itr, (int)do_reset_);
-  }
   pf_set_reset_flag(pf_, (int)do_reset_);
 
   res.success = true;
   return true;
 }
 
-void AmclNode::createWeightVec(std::vector<double>& max_w_vec)
-{
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){ 
-    pf_sample_set_t *set;
-    set = (*itr)->sets + ((*itr)->current_set + 1) % 2;
-    std::vector<double> w_vec;
-    for(int i=0; i<set->sample_count; i++){
-      pf_sample_t *sample;
-      sample = set->samples + i;
-      w_vec.push_back(sample->weight);
-    }
-    std::cout << set->sample_count << "," << *std::max_element(w_vec.begin(), w_vec.end()) << std::endl;
-    max_w_vec.push_back(*std::max_element(w_vec.begin(), w_vec.end()));
-  }
-}
+// void AmclNode::createWeightVec(std::vector<double>& max_w_vec)
+// {
+//   for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){ 
+//     pf_sample_set_t *set;
+//     set = (*itr)->sets + ((*itr)->current_set + 1) % 2;
+//     std::vector<double> w_vec;
+//     for(int i=0; i<set->sample_count; i++){
+//       pf_sample_t *sample;
+//       sample = set->samples + i;
+//       w_vec.push_back(sample->weight);
+//     }
+//     std::cout << set->sample_count << "," << *std::max_element(w_vec.begin(), w_vec.end()) << std::endl;
+//     max_w_vec.push_back(*std::max_element(w_vec.begin(), w_vec.end()));
+//   }
+// }
 
-void AmclNode::createWSumVec(std::vector<double>& max_w_vec)
-{
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){ 
-    max_w_vec.push_back((*itr)->w_sum);
-  }
-}
+// void AmclNode::createWSumVec(std::vector<double>& max_w_vec)
+// {
+//   for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){ 
+//     max_w_vec.push_back((*itr)->w_sum);
+//   }
+// }
 
-void AmclNode::createMeanPosVec(std::vector<double>& mean_pos_vec, int axis)
-{
-  if(axis>2) return;
-  for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-    pf_sample_set_t *set;
-    set = (*itr)->sets + ((*itr)->current_set + 1) % 2;
-    mean_pos_vec.push_back(set->mean.v[axis]);
-  }
-}
+// void AmclNode::createMeanPosVec(std::vector<double>& mean_pos_vec, int axis)
+// {
+//   if(axis>2) return;
+//   for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
+//     pf_sample_set_t *set;
+//     set = (*itr)->sets + ((*itr)->current_set + 1) % 2;
+//     mean_pos_vec.push_back(set->mean.v[axis]);
+//   }
+// }
 
-double AmclNode::calcMean(std::vector<double>& vec)
-{
-  return std::accumulate(vec.begin(), vec.end(), 0.0) / vec.size();
-}
+// double AmclNode::calcMean(std::vector<double>& vec)
+// {
+//   return std::accumulate(vec.begin(), vec.end(), 0.0) / vec.size();
+// }
 
-double AmclNode::calcSigma(std::vector<double>& vec, double mean)
-{
-  return (std::inner_product(vec.begin(), vec.end(), vec.begin(), 0.0) - mean * mean * vec.size())/ (vec.size() - 1.0);
-}
+// double AmclNode::calcSigma(std::vector<double>& vec, double mean)
+// {
+//   return (std::inner_product(vec.begin(), vec.end(), vec.begin(), 0.0) - mean * mean * vec.size())/ (vec.size() - 1.0);
+// }
 
 void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
 {
@@ -1375,10 +1347,6 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
     odata.delta = delta;
 
     // Use the action data to update the filter
-    for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-      odom_->UpdateAction(*itr, (AMCLSensorData *)&odata);
-    }
-
     odom_->UpdateAction(pf_, (AMCLSensorData *)&odata);
 
     // Pose at last filter update
@@ -1388,7 +1356,6 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
   bool resampled = false;
   // If the robot has moved, update the filter
 
-  std::vector<int> idx;
   if (lasers_update_[laser_index])
   {
     AMCLLaserData ldata;
@@ -1452,122 +1419,88 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
                            (i * angle_increment);
     }
     
-    if(multi_mcl_){
-      for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-        lasers_[laser_index]->UpdateSensor(*itr, (AMCLSensorData *)&ldata);
-      }
-    }
     lasers_[laser_index]->UpdateSensor(pf_, (AMCLSensorData *)&ldata);
-    
-    // ここから複数MCLの重み付け，リサンプリング計算
     if(multi_mcl_){
-      // auto start = std::chrono::system_clock::now();
-
-      //max_w_vecは各MCLに対する重みのvector
-      //w_sum_vec = (w_sum_1, w_sum_2, ..., w_sum_(pf_vector_size)) 
-      std::vector<double> max_w_vec;
-      std::vector<double> mean_pos_x;
-      std::vector<double> mean_pos_y;
-
-      // createWeightVecは各MCLの最尤なパーティクルの重みのvectorを生成する
-      // createWeightVec(max_w_vec);
-      // createWSumVecは各MCLの重みの合計のvectorを生成する
-      createWSumVec(max_w_vec);
-
-      //各パーティクルの平均位置をvectorにする
-      // createMeanPosVec(mean_pos_x, 0);
-      // createMeanPosVec(mean_pos_y, 1);
-      
-      // double x_mean = 0.0, y_mean = 0.0, x_var = 0.0, y_var = 0.0, x_dev = 0.0, y_dev = 0.0;
-      // x_mean = calcMean(mean_pos_x);
-      // y_mean = calcMean(mean_pos_y);
-      // x_var = calcSigma(mean_pos_x, x_mean);
-      // y_var = calcSigma(mean_pos_y, y_mean);
-      // x_dev = std::sqrt(x_var);
-      // y_dev = std::sqrt(y_var);
-      // ROS_INFO("x_mean: %lf, y_mean: %lf, x_var: %lf, y_var: %lf, x_dev: %lf, y_dev: %lf", x_mean, y_mean, x_var, y_var, x_dev, y_dev);
-      
-      // MCLの重みの正規化
-      const double sum = std::accumulate(max_w_vec.begin(), max_w_vec.end(), 0.0);
-      for(auto& i:max_w_vec){
-        i /= sum;
+/*       // motion_update
+      // alphaの変化量に従ってalpha_thを変更する
+      if(alpha_tmp_init_){
+        double d_alpha = alpha_tmp_ -  pf_->w_sum;
+        std::normal_distribution<double> rand_diff(d_alpha, 1/d_alpha);
+        for(auto &i:alpha_th_vector_){
+          i.alpha_th += rand_diff(mt_);
+        }
       }
-      
-      // MCLが持つ重みに従って添字vector idx(0, 1, ..., pf_vector_size)をソートする
-      idx = std::vector<int>(max_w_vec.size(), 0);
-      std::iota(idx.begin(), idx.end(), 0);
+      else{
+        alpha_tmp_ = pf_->w_sum;
+        alpha_tmp_init_ = true;
+      }
+ */
+      // 評価用pfの作成
+      // pf_t* pf_reset_try = *pf_;
+      pf_t* pf_reset_try;
+      pf_reset_try = (pf_t*)malloc(sizeof(pf_t));
+      memcpy(pf_reset_try, pf_, (size_t)sizeof(pf_t));
 
+      pf_reset_try->alpha = pf_->w_sum * 2;
+
+      // 絶対にリセットが起こるalpha_thでリセットさせてみる
+      pf_expansion_reset(pf_reset_try);
+
+      // リセットが起きたalpha_thの評価をする
+      lasers_[laser_index]->UpdateSensor(pf_reset_try, (AMCLSensorData *)&ldata); 
+
+      ROS_INFO("alpha_th: %lf, Before Reset: %lf, After Reset: %lf", pf_->alpha, pf_->w_sum, pf_reset_try->w_sum);
+
+      std_msgs::Float64 w_sum_diff;
+      w_sum_diff.data = pf_reset_try->w_sum - pf_->w_sum;
+      w_sum_diff_pub_.publish(w_sum_diff);
+
+      // reset起こすのと起こさないのどちらがよいか
+      if(pf_reset_try->w_sum > pf_->w_sum){
+        pf_->alpha = pf_reset_try->alpha;
+      }
+
+      /*
+      // リセットが起きないときのw_sumを1としたときのリセットが起きた時のw_sumの比を求める
+      double weight_ratio = pf_reset_try->w_sum / pf_->w_sum;
+      // 比率に従ってalpha_thの重みを変更する
+      for(auto &i:alpha_th_vector_){
+        if(i.alpha_th > pf_->w_sum){
+          i.alpha_th *= weight_ratio;
+        }
+      }
+      // 重みの総和を求める
+      const double weight_sum = std::accumulate(
+        alpha_th_vector_.begin(), alpha_th_vector_.end(), 0.0,
+        [](double sum, alpha_th_particle& particle){return sum+particle.weight;}
+      );
+      // 正規化
+      for(auto &i:alpha_th_vector_){
+        i.weight /= weight_sum;
+      }
+
+      // sortする
       std::sort(
-        idx.begin(),
-        idx.end(),
-        [&](int x, int y){return max_w_vec[x] > max_w_vec[y];}
+        alpha_th_vector_.begin(),
+        alpha_th_vector_.end(),
+        [&](alpha_th_particle a, alpha_th_particle b){return a.weight > b.weight;}
       );
 
-      double w_cnt = 0.0;
-      std::vector<pf_t*> pf_vector_current;
-
-      // 各MCLが持つ重みに従ってリサンプリング
-      for(int k=0; k<pf_vector_size_; k++){
-        if(w_cnt <= 0.8){
-          pf_vector_current.push_back(pf_vector_[idx[k]]);
-          for(int j=1; j<std::round(pf_vector_size_ * max_w_vec[idx[k]]); j++){
-            k++;
-            pf_vector_current.push_back(pf_vector_[idx[k]]);
-          }
+      // リサンプリング
+      std::vector<alpha_th_particle> alpha_th_vector_current;
+      for(int i=0; i<alpha_th_vector_size_; i++){
+        for(int j=0; j<std::round(alpha_th_vector_size_ * alpha_th_vector_[i].weight); j++){
+          alpha_th_vector_current.push_back(alpha_th_vector_[i]);
         }
-        else{
-          pf_vector_current.push_back(pf_vector_[idx[k]]);
-          pf_vector_current[k]->alpha = rand_alpha_(mt_);
-        }
-        w_cnt += max_w_vec[idx[k]];
-        // double dist = std::sqrt(std::pow((x_mean - mean_pos_x[k]) + (y_mean - mean_pos_y[k]), 2.0));
-        // 添字，重みの和，インデックス，重み，alpha_th，
-        ROS_INFO("%d, %lf, %d, %lf, %lf"/*, %lf, %lf, %lf"*/
-          ,k 
-          ,w_cnt
-          ,idx[k]
-          ,max_w_vec[idx[k]]
-          ,pf_vector_current[k]->alpha
-          // ,std::abs(x_mean - mean_pos_x[idx[k]])
-          // ,std::abs(y_mean - mean_pos_y[idx[k]])
-          // ,dist
-        );
       }
-      std::cout << std::endl; 
-      pf_vector_ = pf_vector_current;
 
-      // mean_pos_x.erase(mean_pos_x.begin(), mean_pos_x.end());
-      // mean_pos_y.erase(mean_pos_y.begin(), mean_pos_y.end());
-      // createMeanPosVec(mean_pos_x, 0);
-      // createMeanPosVec(mean_pos_y, 1);
+      // alpha_th_vector_size_以上を削除
+      alpha_th_vector_current.erase(alpha_th_vector_current.begin() + alpha_th_vector_size_, alpha_th_vector_current.end());
 
-      // x_mean = calcMean(mean_pos_x);
-      // y_mean = calcMean(mean_pos_y);
-      // x_var = calcSigma(mean_pos_x, x_mean);
-      // y_var = calcSigma(mean_pos_y, y_mean);
-      // x_dev = std::sqrt(x_var);
-      // y_dev = std::sqrt(y_var);
-
-      // for(auto itr=pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-      //   int index = itr - pf_vector_.begin();
-      //   double dist = std::sqrt(std::pow((x_mean - mean_pos_x[index]) + (y_mean - mean_pos_y[index]), 2.0));
-      //   std::cout << dist << ", ";
-      //   if(x_dev > 5.0 &&(dist > x_dev || dist > y_dev*2)){
-      //     pf_sample_set_t *set;
-      //     set = (*itr)->sets + ((*itr)->current_set + 1) % 2;
-      //     pf_vector_t mean = pf_vector_zero();
-      //     mean.v[0] = x_mean;
-      //     mean.v[1] = y_mean;
-      //     pf_init(*itr, mean, set->cov);
-      //   }
-      // }
-      // std::cout << std::endl;
-
-      // auto d = std::chrono::system_clock::now() - start;
-      
-      for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-        pf_expansion_reset(*itr);
-      }
+      alpha_th_vector_ = alpha_th_vector_current;
+      ROS_INFO("Best alpha_th: %lf", alpha_th_vector_[0].alpha_th);
+      pf_->alpha = alpha_th_vector_[0].alpha_th; */
+      free(pf_reset_try);
     }
 
     pf_expansion_reset(pf_);
@@ -1582,20 +1515,6 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
     w_sum.data = pf_->w_sum;
     w_sum_pub_.publish(w_sum);
 
-    if(pub_cnt_ == 10){
-      for(auto itr=pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-        int itr_cnt = itr - pf_vector_.begin();
-        if ((*itr)->is_done_reset)
-        {
-          std_msgs::Bool notify;
-          notify.data = (*itr)->is_done_reset;
-          // reset_notify_pub_vec_[itr_cnt].publish(notify);
-        }
-        std_msgs::Float64 w_sum;
-        w_sum.data = (*itr)->w_sum;
-        // w_sum_pub_vec_[itr_cnt].publish(w_sum);
-      }
-    }
     w_sum_sum_ += pf_->w_sum;
 
     lasers_update_[laser_index] = false;
@@ -1605,33 +1524,8 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
     // Resample the particles
     if (!(++resample_count_ % resample_interval_))
     {
-      for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-        pf_update_resample(*itr);
-      }
       pf_update_resample(pf_);
       resampled = true;
-    }
-
-    for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-      pf_sample_set_t *set = (*itr)->sets + (*itr)->current_set;
-      int itr_cnt = itr - pf_vector_.begin();
-      if (!m_force_update)
-      {
-        geometry_msgs::PoseArray cloud_msg;
-        cloud_msg.header.stamp = ros::Time::now();
-        cloud_msg.header.frame_id = global_frame_id_;
-        cloud_msg.poses.resize(set->sample_count);
-        for (int i = 0; i < set->sample_count; i++)
-        {
-          tf::poseTFToMsg(tf::Pose(tf::createQuaternionFromYaw(set->samples[i].pose.v[2]),
-                                   tf::Vector3(set->samples[i].pose.v[0],
-                                               set->samples[i].pose.v[1], 0)),
-                          cloud_msg.poses[i]);
-        }
-        // if(pub_cnt_ == 10){
-          particlecloud_pub_vec_[itr_cnt].publish(cloud_msg);
-        // }
-      }
     }
 
     pf_sample_set_t *set = pf_->sets + pf_->current_set;
@@ -1662,54 +1556,27 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
     double max_weight = 0.0;
     int max_weight_hyp = -1;
     std::vector<amcl_hyp_t> hyps;
-    if(multi_mcl_){
-      hyps.resize(pf_vector_[idx[0]]->sets[pf_vector_[idx[0]]->current_set].cluster_count);
-      for (int hyp_count = 0;
-           hyp_count < pf_vector_[idx[0]]->sets[pf_vector_[idx[0]]->current_set].cluster_count; hyp_count++)
+    hyps.resize(pf_->sets[pf_->current_set].cluster_count);
+    for (int hyp_count = 0;
+          hyp_count < pf_->sets[pf_->current_set].cluster_count; hyp_count++)
+    {
+      double weight;
+      pf_vector_t pose_mean;
+      pf_matrix_t pose_cov;
+      if (!pf_get_cluster_stats(pf_, hyp_count, &weight, &pose_mean, &pose_cov))
       {
-        double weight;
-        pf_vector_t pose_mean;
-        pf_matrix_t pose_cov;
-        if (!pf_get_cluster_stats(pf_vector_[idx[0]], hyp_count, &weight, &pose_mean, &pose_cov))
-        {
-          ROS_ERROR("Couldn't get stats on cluster %d", hyp_count);
-          break;
-        }
-  
-        hyps[hyp_count].weight = weight;
-        hyps[hyp_count].pf_pose_mean = pose_mean;
-        hyps[hyp_count].pf_pose_cov = pose_cov;
-  
-        if (hyps[hyp_count].weight > max_weight)
-        {
-          max_weight = hyps[hyp_count].weight;
-          max_weight_hyp = hyp_count;
-        }
+        ROS_ERROR("Couldn't get stats on cluster %d", hyp_count);
+        break;
       }
-    }
-    else{
-      hyps.resize(pf_->sets[pf_->current_set].cluster_count);
-      for (int hyp_count = 0;
-           hyp_count < pf_->sets[pf_->current_set].cluster_count; hyp_count++)
+
+      hyps[hyp_count].weight = weight;
+      hyps[hyp_count].pf_pose_mean = pose_mean;
+      hyps[hyp_count].pf_pose_cov = pose_cov;
+
+      if (hyps[hyp_count].weight > max_weight)
       {
-        double weight;
-        pf_vector_t pose_mean;
-        pf_matrix_t pose_cov;
-        if (!pf_get_cluster_stats(pf_, hyp_count, &weight, &pose_mean, &pose_cov))
-        {
-          ROS_ERROR("Couldn't get stats on cluster %d", hyp_count);
-          break;
-        }
-  
-        hyps[hyp_count].weight = weight;
-        hyps[hyp_count].pf_pose_mean = pose_mean;
-        hyps[hyp_count].pf_pose_cov = pose_cov;
-  
-        if (hyps[hyp_count].weight > max_weight)
-        {
-          max_weight = hyps[hyp_count].weight;
-          max_weight_hyp = hyp_count;
-        }
+        max_weight = hyps[hyp_count].weight;
+        max_weight_hyp = hyp_count;
       }
     }
 
@@ -1726,8 +1593,6 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
          puts("");
        */
       
-      // PoseWithCovarianceStampedを配信するところコメントアウト中
-      //  /*
       geometry_msgs::PoseWithCovarianceStamped p;
       // Fill in the header
       p.header.frame_id = global_frame_id_;
@@ -1837,10 +1702,6 @@ void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr &laser_scan)
       save_pose_last_time = now;
     }
   }
-  pub_cnt_++;
-  if(pub_cnt_ > 10){
-    pub_cnt_ = 0;
-  }
 }
 
 double
@@ -1942,9 +1803,6 @@ void AmclNode::applyInitialPose()
   boost::recursive_mutex::scoped_lock cfl(configuration_mutex_);
   if (initial_pose_hyp_ != NULL && map_ != NULL)
   {
-    for(auto itr = pf_vector_.begin(); itr != pf_vector_.end(); ++itr){
-      pf_init(*itr, initial_pose_hyp_->pf_pose_mean, initial_pose_hyp_->pf_pose_cov);
-    }
     pf_init(pf_, initial_pose_hyp_->pf_pose_mean, initial_pose_hyp_->pf_pose_cov);
     pf_init_ = false;
 
